@@ -7,7 +7,7 @@
 - Python 3.11 or later (for `tomllib`)
 - git 2.31 or later
 - zellij (tested with 0.45)
-- Optional: [`gh`](https://cli.github.com), to check out pull requests by number or URL
+- Optional: [`gh`](https://cli.github.com), to check out GitHub pull requests and issues by number or URL
 - Optional: a [Linear](https://linear.app) API key, to name branches after Linear issues
 
 ## Install
@@ -57,7 +57,7 @@ shared_except "locked" {
 |---------|--------------|
 | `wt new ABC-123` | Creates a worktree for the ticket, runs the post-create hook, and opens the tab `ABC-123`. |
 | `wt new my-branch` | Same for a plain branch name. `branch_prefix` is added unless the name already has a `/` or the branch exists. |
-| `wt new 123` | Checks out the head branch of PR #123 (also `#123` or the PR URL). Needs `gh`. |
+| `wt new 123` | If #123 is a PR, checks out its head branch and opens the tab `PR-123`. If it is an issue, uses the issue's branch and opens the tab `GH-123`. Also accepts `#123` or the URL. Needs `gh`. |
 | `wt rm ABC-123` | Runs the pre-remove hook, removes the worktree, and closes its tab. |
 | `wt open ABC-123` | Opens or focuses the tab of an existing worktree. With no argument, uses the current directory's worktree. |
 | `wt ls` | Lists the repo's worktrees: tab name, branch, path. |
@@ -77,6 +77,7 @@ shared_except "locked" {
 ## How names are chosen
 
 - A ticket key is any `KEY-123`. `wt` uses an existing local or origin branch for that ticket first. Otherwise it asks Linear for the issue's branch name, using the key in `~/.config/wt/linear-api-key` (chmod 600) or `$LINEAR_API_KEY`.
+- A GitHub issue uses the branch linked to it on GitHub first, then a local or origin branch named `123-…` (with or without `branch_prefix`), else a new `branch_prefix` + `123-<title>`. With `link_issue_branches = true`, `wt` creates that new branch on GitHub with `gh issue develop` so it shows as linked on the issue. This needs `base` to be an `origin/` branch.
 - Directory names are lowercase, so a directory can serve as a Docker Compose project name.
 - A tab is named after the ticket key in its directory (`ABC-123`), else after the directory. The main checkout's tab is `main`.
 - Tabs of repos other than `default_repo` carry `tab_prefix` (`o/ABC-123`), so the same ticket in two repos gets two tabs.

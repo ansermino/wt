@@ -3,7 +3,7 @@
 
   wt                                outside zellij: attach the one session (a tab per worktree of every repo)
                                     inside zellij:  same as `wt sync`
-  wt new  [<ABC-N|branch|PR>] [-b BASE] [-n] create a worktree, run its post-create hook, open its tab
+  wt new  [<ABC-N|branch|#N>] [-b BASE] [-n] create a worktree, run its post-create hook, open its tab
   wt rm   [<name|ABC-N>] [-f] [-d]          run its pre-remove hook, remove it, close its tab
   wt open [<name|ABC-N|dir>]                open or focus a worktree's tab (default: $PWD)
   wt sync                                   add missing tabs for every repo; report tabs with no worktree
@@ -11,7 +11,8 @@
   wt clone <url> [<dir>]                    bare-clone into ./<repo> with a work/<default-branch> worktree
 
 The repo is `--repo NAME`, else the one containing $PWD, else `default_repo` from the config.
-A PR is `123`, `#123` or its GitHub URL, and checks out the PR's head branch (needs `gh`).
+A GitHub PR or issue is `123`, `#123` or its URL (needs `gh`). A PR checks out its head branch;
+an issue uses its linked branch, else an existing `123-…` branch, else a new `123-<title>`.
 `new`/`rm` with no target prompt for one (the form the zellij keybindings use).
 Tickets look like ABC-123 (`ticket_prefix` in the config), though any KEY-123 is accepted.
 Config, layouts and hooks live in ~/.config/wt/ (see config.toml there).
@@ -35,7 +36,7 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "wt"
 TICKET = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
 TICKET_IN_DIR = re.compile(r"(?:^|-)([a-z][a-z0-9]*-\d+)(?:-|$)")
-PR = re.compile(r"#?(\d+)|https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?")
+GH_REF = re.compile(r"#?(\d+)|https?://[^/]+/([^/]+/[^/]+)/(pull|issues)/(\d+)(?:[/?#].*)?")
 GH_REMOTE = re.compile(r"[/:]([^/:]+/[^/]+?)(?:\.git)?/?$")
 DEFAULT_BODY = """\
         pane split_direction="vertical" {
@@ -195,9 +196,8 @@ def dir_name(branch: str) -> str:
     return re.sub(r"-{2,}", "-", s).strip("-")
 
 
-def branch_for_ticket(cfg: dict, repo: Repo, key: str) -> str:
-    """An existing branch for the ticket wins over Linear's, so a retitled issue keeps its branch."""
-    pat = re.compile(rf"(?:^|/){re.escape(key.lower())}(?:-|$)")
+def existing_branch(repo: Repo, label: str, pat: re.Pattern) -> str | None:
+    """The one local or origin branch matching `pat`, preferring `branch_prefix` ones; None if there is none."""
     refs = git("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin", cwd=repo.common)
     found: list[str] = []
     for ref in refs.splitlines():
@@ -208,7 +208,14 @@ def branch_for_ticket(cfg: dict, repo: Repo, key: str) -> str:
     if len(mine) == 1 or (len(found) == 1 and (mine := found)):
         return mine[0]
     if found:
-        raise Die(f"{key} matches several branches, pass one explicitly:\n  " + "\n  ".join(found))
+        raise Die(f"{label} matches several branches, pass one explicitly:\n  " + "\n  ".join(found))
+    return None
+
+
+def branch_for_ticket(cfg: dict, repo: Repo, key: str) -> str:
+    """An existing branch for the ticket wins over Linear's, so a retitled issue keeps its branch."""
+    if branch := existing_branch(repo, key, re.compile(rf"(?:^|/){re.escape(key.lower())}(?:-|$)")):
+        return branch
     branch = linear_issue(cfg, key)["branchName"].lower()
     if "/" not in branch and repo.branch_prefix:
         branch = repo.branch_prefix + branch
@@ -244,14 +251,46 @@ def linear_issue(cfg: dict, key: str) -> dict:
     return issue
 
 
-def pr_branch(repo: Repo, number: str, url_repo: str | None, fetch: bool) -> str:
-    """The PR's head branch; a fork's has no origin ref, so it's fetched from `pull/N/head`."""
+def gh_slug(repo: Repo, url_repo: str | None = None) -> str:
     m = GH_REMOTE.search(git("remote", "get-url", "origin", cwd=repo.common))
     if not m:
         raise Die("can't derive a GitHub owner/repo from origin's URL")
     slug = m.group(1)
     if url_repo and url_repo.lower() != slug.lower():
-        raise Die(f"that PR is in {url_repo}, but {repo.name}'s origin is {slug} (try --repo)")
+        raise Die(f"that URL is in {url_repo}, but {repo.name}'s origin is {slug} (try --repo)")
+    return slug
+
+
+def gh_branch(repo: Repo, m: re.Match, fetch: bool) -> tuple[str, str]:
+    """The branch for a GH_REF match, and the `pr-N` / `gh-N` lead its dir name gets."""
+    slug, number = gh_slug(repo, m.group(2)), m.group(1) or m.group(4)
+    if m.group(3) != "pull":
+        # Issues and PRs share numbers; this endpoint returns both and marks PRs with `pull_request`.
+        issue = json.loads(run("gh", "api", f"repos/{slug}/issues/{number}"))
+        if "pull_request" not in issue:
+            return issue_branch(repo, slug, issue), f"gh-{issue['number']}"
+    return pr_branch(repo, slug, number, fetch), f"pr-{int(number)}"
+
+
+def issue_branch(repo: Repo, slug: str, issue: dict) -> str:
+    n = issue["number"]
+    print(f">> issue #{n} ({issue['state']}): {issue['title']}")
+    out = run("gh", "issue", "develop", "--list", str(n), "-R", slug, check=False)
+    linked = [line.split()[0] for line in out.splitlines() if line.strip()]
+    if len(linked) == 1:
+        return linked[0]
+    if linked:
+        raise Die(f"issue #{n} has several linked branches, pass one explicitly:\n  " + "\n  ".join(linked))
+    if branch := existing_branch(repo, f"issue #{n}", re.compile(rf"(?:^|/){n}-")):
+        return branch
+    title = re.sub(r"[^a-z0-9]+", "-", issue["title"].lower())[:50].strip("-")
+    branch = repo.branch_prefix + f"{n}-{title}".rstrip("-")
+    run("git", "check-ref-format", "--branch", branch)
+    return branch
+
+
+def pr_branch(repo: Repo, slug: str, number: str, fetch: bool) -> str:
+    """The PR's head branch; a fork's has no origin ref, so it's fetched from `pull/N/head`."""
     pr = json.loads(run("gh", "pr", "view", number, "-R", slug,
                         "--json", "number,title,state,headRefName,isCrossRepository"))
     print(f">> PR #{pr['number']} ({pr['state'].lower()}): {pr['title']}")
@@ -265,16 +304,17 @@ def pr_branch(repo: Repo, number: str, url_repo: str | None, fetch: bool) -> str
     return branch
 
 
-def resolve_branch(cfg: dict, repo: Repo, target: str, fetch: bool = False) -> str:
-    if m := PR.fullmatch(target):
-        return pr_branch(repo, m.group(1) or m.group(3), m.group(2), fetch)
+def resolve_branch(cfg: dict, repo: Repo, target: str, fetch: bool = False) -> tuple[str, str | None]:
+    """The branch for `target`, and the `pr-N` / `gh-N` lead its dir name gets, if any."""
+    if m := GH_REF.fullmatch(target):
+        return gh_branch(repo, m, fetch)
     if TICKET.fullmatch(target):
-        return branch_for_ticket(cfg, repo, target)
+        return branch_for_ticket(cfg, repo, target), None
     if repo.has_ref(f"refs/heads/{target}") or repo.has_ref(f"refs/remotes/origin/{target}"):
-        return target
+        return target, None
     branch = target if "/" in target or not repo.branch_prefix else repo.branch_prefix + target
     run("git", "check-ref-format", "--branch", branch)
-    return branch
+    return branch, None
 
 
 def find_worktree(repo: Repo, target: str) -> tuple[Path, str | None]:
@@ -411,7 +451,7 @@ def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool)
             if in_zellij() and not dry_run:
                 open_tab(repo, path)
             return
-    branch = resolve_branch(cfg, repo, target, fetch=not dry_run)
+    branch, lead = resolve_branch(cfg, repo, target, fetch=not dry_run)
     for path, b in repo.worktrees():
         if b == branch:
             print(f">> {branch} is already checked out at {path}")
@@ -419,10 +459,11 @@ def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool)
                 open_tab(repo, path)
             return
     name = dir_name(branch)
-    if m := PR.fullmatch(target):
-        # The `pr-N` lead is what Repo.tab reads as the key, so the tab is `PR-N`.
-        lead = f"pr-{int(m.group(1) or m.group(3))}"
-        name = name if name.startswith(lead + "-") else f"{lead}-{name}"
+    if lead:
+        # The lead is what Repo.tab reads as the key, so the tab is `PR-N` / `GH-N`.
+        number = lead.split("-")[1]
+        rest = name.removeprefix(lead + "-").removeprefix(number + "-")
+        name = f"{lead}-{rest}" if rest else lead
     path = expand(repo.worktree_dir, repo=repo.name, name=name, common=repo.common,
                   main=repo.main, parent=repo.main.parent)
     if path.exists():
@@ -433,16 +474,28 @@ def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool)
         how, add = "existing local branch", ["worktree", "add", str(path), branch]
     elif repo.has_ref(f"refs/remotes/origin/{branch}"):
         how, add = "tracking origin", ["worktree", "add", "--track", "-b", branch, str(path), f"origin/{branch}"]
-    elif PR.fullmatch(target) and not dry_run:
+    elif lead and lead.startswith("pr-") and not dry_run:
         raise Die(f"{branch} is not on origin after fetching; can't check out the PR")
     else:
         how = f"new, from {base or repo.base}"
         add = ["worktree", "add", "--no-track", "-b", branch, str(path), base or repo.base]
+    link = how.startswith("new") and lead and lead.startswith("gh-") and cfg.get("link_issue_branches", False)
+    if link and not (base or repo.base).startswith("origin/"):
+        print(f"   note: not linking to the issue, {base or repo.base} is not an origin branch")
+        link = False
+    if link:
+        how += f", {'would be ' if dry_run else ''}linked to issue #{number} on GitHub"
     if base and not how.startswith("new"):
         print(f"   note: --base ignored, {branch} already exists")
     print(f">> branch {branch} ({how})\n   path   {path}\n   tab    {repo.tab(path)}")
     if dry_run:
         return
+    if link:
+        # GitHub creates the branch on origin; the worktree then tracks it.
+        run("gh", "issue", "develop", number, "-R", gh_slug(repo), "--name", branch,
+            "--base", (base or repo.base).removeprefix("origin/"))
+        git("fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=repo.common)
+        add = ["worktree", "add", "--track", "-b", branch, str(path), f"origin/{branch}"]
     git(*add, cwd=repo.common)
     run_hook(repo, "post-create", path, branch)
     if in_zellij():
@@ -529,7 +582,7 @@ def attach(cfg: dict, repos: list[Repo]) -> None:
 
 
 def prompt_new(repo: Repo) -> tuple[str, str | None]:
-    target = input(f"[{repo.name}] ticket, branch or PR: ").strip()
+    target = input(f"[{repo.name}] ticket, branch, PR or issue: ").strip()
     if not target:
         sys.exit(0)
     return target, input(f"base [{repo.base}]: ").strip() or None
@@ -560,7 +613,7 @@ def main() -> None:
     ap.add_argument("--repo", help="configured repo name (default: the repo containing $PWD)")
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("new", help="create a worktree and open its tab")
-    p.add_argument("target", nargs="?", help=f"ticket key ({key}-123), branch name, or PR (123, #123, URL)")
+    p.add_argument("target", nargs="?", help=f"ticket key ({key}-123), branch name, or GitHub PR/issue (123, #123, URL)")
     p.add_argument("-b", "--base", help="base for a new branch (default: config `base`, origin/main)")
     p.add_argument("-n", "--dry-run", action="store_true", help="print what would happen")
     p = sub.add_parser("rm", help="remove a worktree and close its tab")

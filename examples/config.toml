@@ -5,6 +5,7 @@ default_repo = "myapp"            # used when $PWD is outside every git repo; it
 base = "origin/main"              # base for new branches
 branch_prefix = "me/"             # prepended to plain branch names
 ticket_prefix = "ABC"             # ticket key shown in wt --help examples
+link_issue_branches = false       # true: create new GitHub-issue branches on origin, linked to the issue
 # linear_api_key_file = "~/.config/wt/linear-api-key"   # the default; must be chmod 600. $LINEAR_API_KEY wins
 
 extra_tabs = [                    # appended after the worktree tabs
