@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""wt — git worktrees, zellij tabs and Claude sessions, across repos.
+
+  wt                                outside zellij: attach the one session (a tab per worktree of every repo)
+                                    inside zellij:  same as `wt sync`
+  wt new  [<ABC-N|branch|PR>] [-b BASE] [-n] create a worktree, run its post-create hook, open its tab
+  wt rm   [<name|ABC-N>] [-f] [-d]          run its pre-remove hook, remove it, close its tab
+  wt open [<name|ABC-N|dir>]                open or focus a worktree's tab (default: $PWD)
+  wt sync                                   add missing tabs for every repo; report tabs with no worktree
+  wt ls                                     list the repo's worktrees
+  wt clone <url> [<dir>]                    bare-clone into ./<repo> with a work/<default-branch> worktree
+
+The repo is `--repo NAME`, else the one containing $PWD, else `default_repo` from the config.
+A PR is `123`, `#123` or its GitHub URL, and checks out the PR's head branch (needs `gh`).
+`new`/`rm` with no target prompt for one (the form the zellij keybindings use).
+Tickets look like ABC-123 (`ticket_prefix` in the config), though any KEY-123 is accepted.
+Config, layouts and hooks live in ~/.config/wt/ (see config.toml there).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wt"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "wt"
+TICKET = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
+TICKET_IN_DIR = re.compile(r"(?:^|-)([a-z][a-z0-9]*-\d+)(?:-|$)")
+PR = re.compile(r"#?(\d+)|https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?")
+GH_REMOTE = re.compile(r"[/:]([^/:]+/[^/]+?)(?:\.git)?/?$")
+DEFAULT_BODY = """\
+        pane split_direction="vertical" {
+            pane name="claude" command="bash" size="70%" focus=true {
+                args "-c" "claude --continue || claude"
+            }
+            pane name="shell"
+        }
+"""
+CHROME = """\
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+"""
+
+
+class Die(Exception):
+    pass
+
+
+def run(*cmd: str, cwd: Path | None = None, check: bool = True) -> str:
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise Die(f"{' '.join(cmd)}: {p.stderr.strip() or p.stdout.strip()}")
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def git(*args: str, cwd: Path, check: bool = True) -> str:
+    return run("git", "-C", str(cwd), *args, check=check)
+
+
+def expand(s: str, **vars: object) -> Path:
+    return Path(os.path.expanduser(s.format(**vars))).resolve()
+
+
+def common_dir(path: Path) -> Path | None:
+    out = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=path, check=False)
+    return Path(out).resolve() if out else None
+
+
+@dataclass
+class Repo:
+    name: str
+    common: Path
+    main: Path
+    worktree_dir: str
+    layout: str
+    hooks: Path
+    base: str
+    branch_prefix: str
+    tab_prefix: str
+
+    def tab(self, path: Path) -> str:
+        """`ABC-123` for a dir carrying a ticket key, else the dir name; `main` for the main checkout."""
+        if path == self.main:
+            return self.tab_prefix + "main"
+        m = TICKET_IN_DIR.search(path.name.lower())
+        return self.tab_prefix + (m.group(1).upper() if m else path.name)
+
+    def worktrees(self) -> list[tuple[Path, str | None]]:
+        """(path, branch) per checked-out worktree, main first; the bare root is skipped."""
+        out, path, branch, bare = [], None, None, False
+        for line in git("worktree", "list", "--porcelain", cwd=self.common).splitlines() + [""]:
+            if line.startswith("worktree "):
+                path, branch, bare = Path(line[9:]).resolve(), None, False
+            elif line.startswith("branch "):
+                branch = line[7:].removeprefix("refs/heads/")
+            elif line == "bare":
+                bare = True
+            elif line == "" and path:
+                if not bare:
+                    out.append((path, branch))
+                path = None
+        return sorted(out, key=lambda wt: (wt[0] != self.main, wt[0].name))
+
+    def has_ref(self, ref: str) -> bool:
+        return bool(git("rev-parse", "--verify", "--quiet", ref, cwd=self.common, check=False))
+
+
+def load_config() -> dict:
+    f = CONFIG_DIR / "config.toml"
+    return tomllib.loads(f.read_text()) if f.exists() else {}
+
+
+def resolve_repo(cfg: dict, name: str | None) -> Repo:
+    repos = cfg.get("repos", {})
+    if name:
+        if name not in repos:
+            raise Die(f"repo {name!r} is not in {CONFIG_DIR / 'config.toml'}")
+        common = common_dir(expand(repos[name]["path"]))
+    else:
+        common = common_dir(Path.cwd())
+        if common is None:
+            if not (name := cfg.get("default_repo")):
+                raise Die("not inside a git repo and no default_repo configured")
+            return resolve_repo(cfg, name)
+        for n, e in repos.items():
+            if common_dir(expand(e["path"])) == common:
+                name = n
+                break
+    if common is None:
+        raise Die(f"repo {name!r}: path is not a git repo")
+    bare = git("rev-parse", "--is-bare-repository", cwd=common) == "true"
+    entry = repos.get(name, {}) if name else {}
+    name = name or (common.name if bare else common.parent.name)
+    if "main" in entry:
+        main = expand(entry["main"])
+    elif not bare:
+        main = common.parent
+    else:
+        paths = [Path(l[9:]) for l in git("worktree", "list", "--porcelain", cwd=common).splitlines()
+                 if l.startswith("worktree ") and Path(l[9:]).resolve() != common]
+        main = next((p for p in paths if p.name == "main"), paths[0] if paths else common).resolve()
+    return Repo(
+        name=name,
+        common=common,
+        main=main,
+        worktree_dir=entry.get("worktree_dir", "{common}/work/{name}" if bare else "{parent}/{repo}-{name}"),
+        layout=entry.get("layout", name),
+        hooks=expand(entry.get("hooks", str(CONFIG_DIR / "hooks" / name))),
+        base=entry.get("base", cfg.get("base", "origin/main")),
+        branch_prefix=entry.get("branch_prefix", cfg.get("branch_prefix", "")),
+        # Repos share one session, so only the default repo's tabs go unprefixed.
+        tab_prefix=entry.get("tab_prefix", "" if name == cfg.get("default_repo") else f"{name}/"),
+    )
+
+
+def all_repos(cfg: dict, current: Repo | None) -> list[Repo]:
+    """Every configured repo in config order, plus `current` if it isn't configured."""
+    out = []
+    for name in cfg.get("repos", {}):
+        if current and name == current.name:
+            out.append(current)
+            continue
+        try:
+            out.append(resolve_repo(cfg, name))
+        except Die as e:
+            print(f"wt: skipping {name}: {e}", file=sys.stderr)
+    if current and current not in out:
+        out.append(current)
+    return out
+
+
+# ── naming ──────────────────────────────────────────────────────────────────────
+
+
+def dir_name(branch: str) -> str:
+    """Lowercase, so the dir can serve as a Docker Compose project name, which must be lowercase."""
+    s = re.sub(r"[^a-z0-9-]+", "-", branch.rsplit("/", 1)[-1].lower())
+    return re.sub(r"-{2,}", "-", s).strip("-")
+
+
+def branch_for_ticket(cfg: dict, repo: Repo, key: str) -> str:
+    """An existing branch for the ticket wins over Linear's, so a retitled issue keeps its branch."""
+    pat = re.compile(rf"(?:^|/){re.escape(key.lower())}(?:-|$)")
+    refs = git("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin", cwd=repo.common)
+    found: list[str] = []
+    for ref in refs.splitlines():
+        short = ref.removeprefix("refs/heads/").removeprefix("refs/remotes/origin/")
+        if short != "HEAD" and pat.search(short.lower()) and short not in found:
+            found.append(short)
+    mine = [b for b in found if repo.branch_prefix and b.startswith(repo.branch_prefix)]
+    if len(mine) == 1 or (len(found) == 1 and (mine := found)):
+        return mine[0]
+    if found:
+        raise Die(f"{key} matches several branches, pass one explicitly:\n  " + "\n  ".join(found))
+    branch = linear_issue(cfg, key)["branchName"].lower()
+    if "/" not in branch and repo.branch_prefix:
+        branch = repo.branch_prefix + branch
+    return branch
+
+
+def linear_issue(cfg: dict, key: str) -> dict:
+    token = os.environ.get("LINEAR_API_KEY")
+    f = expand(cfg.get("linear_api_key_file", str(CONFIG_DIR / "linear-api-key")))
+    if not token and f.exists():
+        if f.stat().st_mode & 0o077:
+            raise Die(f"{f} is readable by others — chmod 600 {f}")
+        token = f.read_text().strip()
+    if not token:
+        raise Die(f"no Linear API key: put one in {f} (chmod 600) or $LINEAR_API_KEY — "
+                  "create it at https://linear.app/settings/account/security")
+    body = {"query": "query($id: String!) { issue(id: $id) { identifier title branchName } }",
+            "variables": {"id": key.upper()}}
+    req = urllib.request.Request("https://api.linear.app/graphql", data=json.dumps(body).encode(),
+                                 headers={"Authorization": token, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise Die(f"Linear: HTTP {e.code} {e.read().decode(errors='replace')[:300]}") from e
+    except urllib.error.URLError as e:
+        raise Die(f"Linear: {e.reason}") from e
+    issue = (data.get("data") or {}).get("issue")
+    if not issue:
+        errs = data.get("errors") or [{}]
+        raise Die(f"Linear: {key}: {errs[0].get('extensions', {}).get('userPresentableMessage') or errs[0].get('message') or 'not found'}")
+    print(f">> {issue['identifier']}: {issue['title']}")
+    return issue
+
+
+def pr_branch(repo: Repo, number: str, url_repo: str | None, fetch: bool) -> str:
+    """The PR's head branch; a fork's has no origin ref, so it's fetched from `pull/N/head`."""
+    m = GH_REMOTE.search(git("remote", "get-url", "origin", cwd=repo.common))
+    if not m:
+        raise Die("can't derive a GitHub owner/repo from origin's URL")
+    slug = m.group(1)
+    if url_repo and url_repo.lower() != slug.lower():
+        raise Die(f"that PR is in {url_repo}, but {repo.name}'s origin is {slug} (try --repo)")
+    pr = json.loads(run("gh", "pr", "view", number, "-R", slug,
+                        "--json", "number,title,state,headRefName,isCrossRepository"))
+    print(f">> PR #{pr['number']} ({pr['state'].lower()}): {pr['title']}")
+    if not pr["isCrossRepository"]:
+        return pr["headRefName"]
+    branch = f"pr-{pr['number']}-{pr['headRefName']}"
+    run("git", "check-ref-format", "--branch", branch)
+    if fetch and not any(b == branch for _, b in repo.worktrees()):
+        # No `+`: a local branch with commits the PR lacks fails here rather than being overwritten.
+        git("fetch", "--quiet", "origin", f"pull/{pr['number']}/head:refs/heads/{branch}", cwd=repo.common)
+    return branch
+
+
+def resolve_branch(cfg: dict, repo: Repo, target: str, fetch: bool = False) -> str:
+    if m := PR.fullmatch(target):
+        return pr_branch(repo, m.group(1) or m.group(3), m.group(2), fetch)
+    if TICKET.fullmatch(target):
+        return branch_for_ticket(cfg, repo, target)
+    if repo.has_ref(f"refs/heads/{target}") or repo.has_ref(f"refs/remotes/origin/{target}"):
+        return target
+    branch = target if "/" in target or not repo.branch_prefix else repo.branch_prefix + target
+    run("git", "check-ref-format", "--branch", branch)
+    return branch
+
+
+def find_worktree(repo: Repo, target: str) -> tuple[Path, str | None]:
+    p = Path(target).expanduser()
+    p = Path(git("rev-parse", "--show-toplevel", cwd=p, check=False) or p).resolve() if p.is_dir() else None
+    t = target.rstrip("/").lower()
+    wts = repo.worktrees()
+    for path, branch in wts:
+        tab = repo.tab(path).lower()
+        if path == p or path.name.lower() == t or t in (tab, tab.removeprefix(repo.tab_prefix)) or branch == target:
+            return path, branch
+    # A ticket checked out in a reused slot (dir tree-c on branch abc-123-…) is found by its branch.
+    if TICKET.fullmatch(target):
+        pat = re.compile(rf"(?:^|/){re.escape(t)}(?:-|$)")
+        if hits := [(path, b) for path, b in wts if b and pat.search(b.lower())]:
+            return hits[0]
+    raise Die(f"no worktree of {repo.name} matches {target!r} (try `wt ls`)")
+
+
+# ── zellij ──────────────────────────────────────────────────────────────────────
+
+
+def in_zellij() -> bool:
+    return bool(os.environ.get("ZELLIJ"))
+
+
+def zj(*args: str) -> str:
+    return run("zellij", "action", *args)
+
+
+def tabs() -> dict[str, int]:
+    return {t["name"]: t["tab_id"] for t in json.loads(zj("list-tabs", "--json"))}
+
+
+def kdl(s: str) -> str:
+    return json.dumps(s)
+
+
+def tab_body(repo: Repo) -> str:
+    for name in (repo.layout, "default"):
+        f = CONFIG_DIR / "layouts" / f"{name}.kdl"
+        if f.exists():
+            return f.read_text()
+    return DEFAULT_BODY
+
+
+def write_layout(name: str, text: str) -> str:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    f = CACHE_DIR / f"{name}.kdl"
+    f.write_text(text)
+    return str(f)
+
+TAB_BAR = """\
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }
+"""
+STATUS_BAR = """\
+    pane size=2 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+"""
+
+
+def tab_layout(repo: Repo) -> str:
+    # new-tab doesn't apply default_tab_template to bare root panes, so place the bars explicitly.
+    return write_layout(f"{repo.name}-tab", "layout {\n" + TAB_BAR + tab_body(repo) + STATUS_BAR + "}\n")
+
+
+def session_layout(cfg: dict, repos: list[Repo]) -> str:
+    parts, focus = [CHROME], " focus=true"
+    for repo in repos:
+        body = tab_body(repo)
+        for path, _ in repo.worktrees():
+            parts.append(f"    tab name={kdl(repo.tab(path))} cwd={kdl(str(path))}{focus} {{\n{body}    }}\n")
+            focus = ""
+    for t in cfg.get("extra_tabs", []):
+        pane = f"pane command={kdl(t['command'])}" if "command" in t else "pane"
+        parts.append(f"    tab name={kdl(t['name'])} {{\n        {pane}\n    }}\n")
+    return write_layout("session", "".join(parts) + "}\n")
+
+
+def open_tab(repo: Repo, path: Path) -> None:
+    name = repo.tab(path)
+    if name in tabs():
+        zj("go-to-tab-name", name)
+    else:
+        zj("new-tab", "--layout", tab_layout(repo), "--name", name, "--cwd", str(path))
+
+
+def sync(cfg: dict, repos: list[Repo]) -> None:
+    if not in_zellij():
+        raise Die("sync must run inside zellij")
+    existing, live = tabs(), set()
+    for repo in repos:
+        for path, _ in repo.worktrees():
+            live.add(name := repo.tab(path))
+            if name not in existing:
+                print(f"+ {name}")
+                zj("new-tab", "--layout", tab_layout(repo), "--name", name, "--cwd", str(path))
+    for t in cfg.get("extra_tabs", []):
+        live.add(t["name"])
+        if t["name"] not in existing:
+            print(f"+ {t['name']}")
+            zj("new-tab", "--name", t["name"], *(["--", t["command"]] if "command" in t else []))
+    # Stale tabs are reported, not closed — they may hold unsaved work.
+    for name in sorted(set(existing) - live):
+        if not re.fullmatch(r"Tab #\d+", name):
+            print(f"  stale tab (no worktree): {name}")
+
+
+# ── commands ────────────────────────────────────────────────────────────────────
+
+
+def run_hook(repo: Repo, hook: str, path: Path, branch: str | None) -> None:
+    f = repo.hooks / hook
+    if not os.access(f, os.X_OK):
+        return
+    print(f">> {hook} hook")
+    env = os.environ | {"WT_REPO": repo.name, "WT_NAME": path.name, "WT_PATH": str(path),
+                        "WT_BRANCH": branch or "", "WT_MAIN": str(repo.main)}
+    if subprocess.run([str(f)], cwd=path, env=env).returncode != 0:
+        raise Die(f"{f} failed")
+
+
+def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool) -> None:
+    if TICKET.fullmatch(target):
+        try:
+            path, branch = find_worktree(repo, target)
+        except Die:
+            pass
+        else:
+            print(f">> {target} is already checked out at {path} ({branch})")
+            if in_zellij() and not dry_run:
+                open_tab(repo, path)
+            return
+    branch = resolve_branch(cfg, repo, target, fetch=not dry_run)
+    for path, b in repo.worktrees():
+        if b == branch:
+            print(f">> {branch} is already checked out at {path}")
+            if in_zellij() and not dry_run:
+                open_tab(repo, path)
+            return
+    name = dir_name(branch)
+    if m := PR.fullmatch(target):
+        # The `pr-N` lead is what Repo.tab reads as the key, so the tab is `PR-N`.
+        lead = f"pr-{int(m.group(1) or m.group(3))}"
+        name = name if name.startswith(lead + "-") else f"{lead}-{name}"
+    path = expand(repo.worktree_dir, repo=repo.name, name=name, common=repo.common,
+                  main=repo.main, parent=repo.main.parent)
+    if path.exists():
+        raise Die(f"{path} already exists")
+    if not dry_run:
+        git("fetch", "--quiet", "origin", cwd=repo.common, check=False)
+    if repo.has_ref(f"refs/heads/{branch}"):
+        how, add = "existing local branch", ["worktree", "add", str(path), branch]
+    elif repo.has_ref(f"refs/remotes/origin/{branch}"):
+        how, add = "tracking origin", ["worktree", "add", "--track", "-b", branch, str(path), f"origin/{branch}"]
+    elif PR.fullmatch(target) and not dry_run:
+        raise Die(f"{branch} is not on origin after fetching; can't check out the PR")
+    else:
+        how = f"new, from {base or repo.base}"
+        add = ["worktree", "add", "--no-track", "-b", branch, str(path), base or repo.base]
+    if base and not how.startswith("new"):
+        print(f"   note: --base ignored, {branch} already exists")
+    print(f">> branch {branch} ({how})\n   path   {path}\n   tab    {repo.tab(path)}")
+    if dry_run:
+        return
+    git(*add, cwd=repo.common)
+    run_hook(repo, "post-create", path, branch)
+    if in_zellij():
+        open_tab(repo, path)
+    else:
+        print(f"   cd {path}")
+
+
+def cmd_rm(repo: Repo, target: str, force: bool, delete_branch: bool) -> None:
+    path, branch = find_worktree(repo, target)
+    if path == repo.main:
+        raise Die(f"refusing to remove the main worktree {path}")
+    if (dirty := git("status", "--porcelain", cwd=path)) and not force:
+        raise Die(f"{path} has uncommitted changes (use -f):\n{dirty}")
+    run_hook(repo, "pre-remove", path, branch)
+    os.chdir(repo.main)
+    git("worktree", "remove", "--force", str(path), cwd=repo.common)
+    print(f">> removed {path}")
+    if delete_branch and branch:
+        # `branch -d` judges against the bare repo's local HEAD, which lags origin; trust the base instead.
+        merged = subprocess.run(["git", "-C", str(repo.common), "merge-base", "--is-ancestor",
+                                 branch, repo.base]).returncode == 0
+        if git("branch", "-D" if merged else "-d", branch, cwd=repo.common, check=False):
+            print(f">> deleted branch {branch}")
+        else:
+            print(f"   {branch} is not fully merged; to force: git branch -D {branch}")
+    if in_zellij() and (tab_id := tabs().get(repo.tab(path))) is not None:
+        zj("close-tab-by-id", str(tab_id))
+
+
+def cmd_clone(cfg: dict, url: str, dest: str | None) -> None:
+    """Bare clone: `<root>/work/<default-branch>` is the main worktree."""
+    name = re.sub(r"\.git$", "", re.split(r"[/:]", url.rstrip("/"))[-1])
+    if not name:
+        raise Die(f"can't derive a repo name from {url!r}")
+    root = expand(dest) if dest else Path.cwd() / name
+    if root.exists():
+        raise Die(f"{root} already exists; pass a directory: wt clone {url} <dir>")
+    print(f">> bare clone into {root}")
+    if subprocess.run(["git", "clone", "--bare", url, str(root)]).returncode != 0:
+        raise Die("git clone failed")
+    # `clone --bare` sets no fetch refspec, so origin/* would never update.
+    git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*", cwd=root)
+    git("fetch", "--quiet", "origin", cwd=root)
+    default = git("symbolic-ref", "--short", "HEAD", cwd=root)
+    # It also copies every remote branch to a local one that never updates; wt would check those out.
+    if stale := [b for b in git("for-each-ref", "--format=%(refname:short)", "refs/heads", cwd=root).split()
+                 if b != default]:
+        git("branch", "-D", *stale, cwd=root)
+    main = root / "work" / default
+    git("worktree", "add", str(main), default, cwd=root)
+    git("branch", f"--set-upstream-to=origin/{default}", default, cwd=main)
+    print(f">> main worktree {main}")
+
+    f = CONFIG_DIR / "config.toml"
+    home = Path.home().resolve()
+    path = f"~/{root.relative_to(home)}" if root.is_relative_to(home) else str(root)
+    if name in cfg.get("repos", {}):
+        print(f"   {name} is already in {f}; point its path at {path} to use this clone")
+        return
+    key = name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else json.dumps(name)
+    with f.open("a") as fh:
+        fh.write(f'\n[repos.{key}]\npath = "{path}"\n')
+    print(f">> added [repos.{key}] to {f}")
+    repo = resolve_repo(load_config(), name)
+    run_hook(repo, "post-create", main, default)
+    if in_zellij():
+        open_tab(repo, main)
+
+
+def cmd_ls(repo: Repo) -> None:
+    rows = [(repo.tab(p), b or "(detached)", str(p)) for p, b in repo.worktrees()]
+    w = [max(len(r[i]) for r in rows) for i in range(2)]
+    for t, b, p in rows:
+        print(f"{t:<{w[0]}}  {b:<{w[1]}}  {p}")
+
+
+def attach(cfg: dict, repos: list[Repo]) -> None:
+    session = cfg.get("session", "wt")
+    sessions = run("zellij", "list-sessions", "--short", "--no-formatting", check=False).split()
+    if session in sessions:
+        os.execvp("zellij", ["zellij", "attach", session])
+    os.execvp("zellij", ["zellij", "--session", session, "--new-session-with-layout", session_layout(cfg, repos)])
+
+
+def prompt_new(repo: Repo) -> tuple[str, str | None]:
+    target = input(f"[{repo.name}] ticket, branch or PR: ").strip()
+    if not target:
+        sys.exit(0)
+    return target, input(f"base [{repo.base}]: ").strip() or None
+
+
+def prompt_rm(repo: Repo) -> tuple[str, bool, bool]:
+    for p, b in repo.worktrees()[1:]:
+        print(f"  {repo.tab(p):<16} {b}")
+    target = input(f"[{repo.name}] remove: ").strip()
+    if not target:
+        sys.exit(0)
+    if (repo.hooks / "pre-remove").exists():
+        print(f"   runs {repo.hooks / 'pre-remove'} first")
+    if input("continue? [y/N] ").strip().lower() != "y":
+        sys.exit(0)
+    force = input("force (discard uncommitted changes)? [y/N] ").strip().lower() == "y"
+    return target, force, input("delete branch? [y/N] ").strip().lower() == "y"
+
+
+def main() -> None:
+    try:
+        cfg = load_config()
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        sys.exit(f"wt: {CONFIG_DIR / 'config.toml'}: {e}")
+    key = cfg.get("ticket_prefix", "ABC")
+    ap = argparse.ArgumentParser(prog="wt", description=(__doc__ or "").replace("ABC-", f"{key}-"),
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", help="configured repo name (default: the repo containing $PWD)")
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("new", help="create a worktree and open its tab")
+    p.add_argument("target", nargs="?", help=f"ticket key ({key}-123), branch name, or PR (123, #123, URL)")
+    p.add_argument("-b", "--base", help="base for a new branch (default: config `base`, origin/main)")
+    p.add_argument("-n", "--dry-run", action="store_true", help="print what would happen")
+    p = sub.add_parser("rm", help="remove a worktree and close its tab")
+    p.add_argument("target", nargs="?", help=f"dir name, tab name ({key}-123), branch or path")
+    p.add_argument("-f", "--force", action="store_true", help="remove even with uncommitted changes")
+    p.add_argument("-d", "--delete-branch", action="store_true", help="also delete the branch if merged")
+    p = sub.add_parser("open", help="open or focus a worktree's tab")
+    p.add_argument("target", nargs="?", default=".")
+    p = sub.add_parser("clone", help="bare-clone a repo with a work/<default-branch> worktree")
+    p.add_argument("url")
+    p.add_argument("dir", nargs="?", help="default: ./<repo name>")
+    sub.add_parser("sync", help="add missing tabs; report stale ones")
+    sub.add_parser("ls", help="list worktrees")
+    args = ap.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # keep our lines ordered with hook output
+
+    prompted = args.cmd in ("new", "rm") and not args.target
+    try:
+        if args.cmd == "clone":
+            return cmd_clone(cfg, args.url, args.dir)
+        repo = resolve_repo(cfg, args.repo)
+        match args.cmd:
+            case "new":
+                target, base = (args.target, args.base) if args.target else prompt_new(repo)
+                cmd_new(cfg, repo, target, base, args.dry_run)
+            case "rm":
+                target, force, delete = ((args.target, args.force, args.delete_branch)
+                                         if args.target else prompt_rm(repo))
+                cmd_rm(repo, target, force, delete)
+            case "open":
+                path, _ = find_worktree(repo, args.target)
+                open_tab(repo, path)
+            case "sync":
+                sync(cfg, all_repos(cfg, repo))
+            case "ls":
+                cmd_ls(repo)
+            case None:
+                repos = all_repos(cfg, repo)
+                sync(cfg, repos) if in_zellij() else attach(cfg, repos)
+    except (Die, KeyboardInterrupt, EOFError) as e:
+        if str(e):
+            print(f"wt: {e}", file=sys.stderr)
+        if prompted:  # keeps the keybinding's floating pane on screen, which closes on exit
+            try:
+                input("\nfailed — press Enter to close ")
+            except (KeyboardInterrupt, EOFError):
+                pass
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

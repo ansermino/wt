@@ -1,0 +1,6 @@
+        pane split_direction="vertical" {
+            pane name="claude" command="bash" size="70%" focus=true {
+                args "-c" "claude --continue || claude"
+            }
+            pane name="shell"
+        }

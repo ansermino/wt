@@ -1,0 +1,25 @@
+# wt config: copy to ~/.config/wt/config.toml.
+# Template vars for worktree_dir: {repo} {name} {common} {main} {parent} (parent of main).
+session = "work"                  # the one zellij session every repo's tabs live in
+default_repo = "myapp"            # used when $PWD is outside every git repo; its tabs are unprefixed
+base = "origin/main"              # base for new branches
+branch_prefix = "me/"             # prepended to plain branch names
+ticket_prefix = "ABC"             # ticket key shown in wt --help examples
+# linear_api_key_file = "~/.config/wt/linear-api-key"   # the default; must be chmod 600. $LINEAR_API_KEY wins
+
+extra_tabs = [                    # appended after the worktree tabs
+    { name = "sys", command = "btop" },
+    { name = "shell" },
+]
+
+# Repos are listed in tab order. tab_prefix defaults to "<repo>/" for all but default_repo.
+[repos.myapp]
+path = "~/code/myapp"             # a bare clone made by `wt clone`
+worktree_dir = "{common}/work/{name}"
+# layout = "myapp"                # ~/.config/wt/layouts/<layout>.kdl; default: repo name, then default.kdl
+# hooks = "~/.config/wt/hooks/myapp"   # executables post-create / pre-remove
+
+[repos.other]
+path = "~/code/other"             # a normal (non-bare) clone
+worktree_dir = "{parent}/other-{name}"
+tab_prefix = "o/"
