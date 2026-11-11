@@ -3,9 +3,11 @@
 
   wt                                outside zellij: attach the one session (a tab per worktree of every repo)
                                     inside zellij:  same as `wt sync`
-  wt new  [<ABC-N|branch|#N>] [-b BASE] [-n] create a worktree, run its post-create hook, open its tab
+  wt new  [<ABC-N|branch|#N>] [-b BASE] [-n] [--no-focus] [--prompt TEXT]
+                                            create a worktree, run its post-create hook, open its tab
   wt rm   [<name|ABC-N>] [-f] [-d]          run its pre-remove hook, remove it, close its tab
-  wt open [<name|ABC-N|dir>]                open or focus a worktree's tab (default: $PWD)
+  wt open [<name|ABC-N|dir>] [--no-focus]   open or focus a worktree's tab (default: $PWD)
+  wt claude                                 start Claude in the current worktree (layouts run this)
   wt sync                                   add missing tabs for every repo; report tabs with no worktree
   wt ls                                     list the repo's worktrees
   wt clone <url> [<dir>]                    bare-clone into ./<repo> with a work/<default-branch> worktree
@@ -14,6 +16,8 @@ The repo is `--repo NAME`, else the one containing $PWD, else `default_repo` fro
 A GitHub PR or issue is `123`, `#123` or its URL (needs `gh`). A PR checks out its head branch;
 an issue uses its linked branch, else an existing `123-…` branch, else a new `123-<title>`.
 `new`/`rm` with no target prompt for one (the form the zellij keybindings use).
+`--no-focus` opens the tab in the background. `--prompt` starts the new tab's Claude session with
+TEXT as its first message; it needs a new worktree, so an existing one is an error.
 Tickets look like ABC-123 (`ticket_prefix` in the config), though any KEY-123 is accepted.
 Config, layouts and hooks live in ~/.config/wt/ (see config.toml there).
 """
@@ -34,6 +38,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wt"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "wt"
+PROMPT_DIR = CACHE_DIR / "prompts"
 TICKET = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
 TICKET_IN_DIR = re.compile(r"(?:^|-)([a-z][a-z0-9]*-\d+)(?:-|$)")
 GH_REF = re.compile(r"#?(\d+)|https?://[^/]+/([^/]+/[^/]+)/(pull|issues)/(\d+)(?:[/?#].*)?")
@@ -41,7 +46,7 @@ GH_REMOTE = re.compile(r"[/:]([^/:]+/[^/]+?)(?:\.git)?/?$")
 DEFAULT_BODY = """\
         pane split_direction="vertical" {
             pane name="claude" command="bash" size="70%" focus=true {
-                args "-c" "claude --continue || claude"
+                args "-c" "wt claude"
             }
             pane name="shell"
         }
@@ -397,12 +402,19 @@ def session_layout(cfg: dict, repos: list[Repo]) -> str:
     return write_layout("session", "".join(parts) + "}\n")
 
 
-def open_tab(repo: Repo, path: Path) -> None:
+def open_tab(repo: Repo, path: Path, focus: bool = True) -> None:
     name = repo.tab(path)
     if name in tabs():
-        zj("go-to-tab-name", name)
+        if focus:
+            zj("go-to-tab-name", name)
     else:
-        zj("new-tab", "--layout", tab_layout(repo), "--name", name, "--cwd", str(path))
+        zj("new-tab", "--layout", tab_layout(repo), "--name", name, "--cwd", str(path),
+           *([] if focus else ["--no-focus"]))
+
+
+def prompt_file(path: Path) -> Path:
+    # Keyed by the full path: worktree dir names repeat across repos.
+    return PROMPT_DIR / str(path.resolve()).strip("/").replace("/", "%")
 
 
 def sync(cfg: dict, repos: list[Repo]) -> None:
@@ -440,23 +452,28 @@ def run_hook(repo: Repo, hook: str, path: Path, branch: str | None) -> None:
         raise Die(f"{f} failed")
 
 
-def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool) -> None:
+def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool,
+            focus: bool = True, prompt: str | None = None) -> None:
     if TICKET.fullmatch(target):
         try:
             path, branch = find_worktree(repo, target)
         except Die:
             pass
         else:
+            if prompt:
+                raise Die(f"{target} is already checked out at {path}; --prompt needs a new worktree")
             print(f">> {target} is already checked out at {path} ({branch})")
             if in_zellij() and not dry_run:
-                open_tab(repo, path)
+                open_tab(repo, path, focus)
             return
     branch, lead = resolve_branch(cfg, repo, target, fetch=not dry_run)
     for path, b in repo.worktrees():
         if b == branch:
+            if prompt:
+                raise Die(f"{branch} is already checked out at {path}; --prompt needs a new worktree")
             print(f">> {branch} is already checked out at {path}")
             if in_zellij() and not dry_run:
-                open_tab(repo, path)
+                open_tab(repo, path, focus)
             return
     name = dir_name(branch)
     if lead:
@@ -488,6 +505,8 @@ def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool)
     if base and not how.startswith("new"):
         print(f"   note: --base ignored, {branch} already exists")
     print(f">> branch {branch} ({how})\n   path   {path}\n   tab    {repo.tab(path)}")
+    if prompt:
+        print(f"   prompt {prompt}")
     if dry_run:
         return
     if link:
@@ -498,10 +517,26 @@ def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool)
         add = ["worktree", "add", "--track", "-b", branch, str(path), f"origin/{branch}"]
     git(*add, cwd=repo.common)
     run_hook(repo, "post-create", path, branch)
+    if prompt:
+        # The tab's `wt claude` consumes this; a pane can't inherit our environment.
+        PROMPT_DIR.mkdir(parents=True, exist_ok=True)
+        prompt_file(path).write_text(prompt)
     if in_zellij():
-        open_tab(repo, path)
+        open_tab(repo, path, focus)
     else:
-        print(f"   cd {path}")
+        print(f"   cd {path} && wt claude" if prompt else f"   cd {path}")
+
+
+def cmd_claude(repo: Repo) -> None:
+    """A pending `--prompt` starts a fresh, named session once; otherwise resume or start one."""
+    top = git("rev-parse", "--show-toplevel", cwd=Path.cwd(), check=False)
+    path = Path(top).resolve() if top else Path.cwd().resolve()
+    f = prompt_file(path)
+    if f.exists():
+        prompt = f.read_text()
+        f.unlink()
+        os.execvp("claude", ["claude", "-n", repo.tab(path), prompt])
+    os.execvp("bash", ["bash", "-c", "claude --continue || claude"])
 
 
 def cmd_rm(repo: Repo, target: str, force: bool, delete_branch: bool) -> None:
@@ -616,12 +651,16 @@ def main() -> None:
     p.add_argument("target", nargs="?", help=f"ticket key ({key}-123), branch name, or GitHub PR/issue (123, #123, URL)")
     p.add_argument("-b", "--base", help="base for a new branch (default: config `base`, origin/main)")
     p.add_argument("-n", "--dry-run", action="store_true", help="print what would happen")
+    p.add_argument("--no-focus", action="store_true", help="open the tab without switching to it")
+    p.add_argument("--prompt", help="first message for the new tab's Claude session")
     p = sub.add_parser("rm", help="remove a worktree and close its tab")
     p.add_argument("target", nargs="?", help=f"dir name, tab name ({key}-123), branch or path")
     p.add_argument("-f", "--force", action="store_true", help="remove even with uncommitted changes")
     p.add_argument("-d", "--delete-branch", action="store_true", help="also delete the branch if merged")
     p = sub.add_parser("open", help="open or focus a worktree's tab")
     p.add_argument("target", nargs="?", default=".")
+    p.add_argument("--no-focus", action="store_true", help="open the tab without switching to it")
+    sub.add_parser("claude", help="start Claude in the current worktree (layouts run this)")
     p = sub.add_parser("clone", help="bare-clone a repo with a work/<default-branch> worktree")
     p.add_argument("url")
     p.add_argument("dir", nargs="?", help="default: ./<repo name>")
@@ -638,14 +677,16 @@ def main() -> None:
         match args.cmd:
             case "new":
                 target, base = (args.target, args.base) if args.target else prompt_new(repo)
-                cmd_new(cfg, repo, target, base, args.dry_run)
+                cmd_new(cfg, repo, target, base, args.dry_run, not args.no_focus, args.prompt)
             case "rm":
                 target, force, delete = ((args.target, args.force, args.delete_branch)
                                          if args.target else prompt_rm(repo))
                 cmd_rm(repo, target, force, delete)
             case "open":
                 path, _ = find_worktree(repo, args.target)
-                open_tab(repo, path)
+                open_tab(repo, path, not args.no_focus)
+            case "claude":
+                cmd_claude(repo)
             case "sync":
                 sync(cfg, all_repos(cfg, repo))
             case "ls":

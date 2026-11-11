@@ -61,6 +61,7 @@ shared_except "locked" {
 | `wt rm ABC-123` | Runs the pre-remove hook, removes the worktree, and closes its tab. |
 | `wt open ABC-123` | Opens or focuses the tab of an existing worktree. With no argument, uses the current directory's worktree. |
 | `wt ls` | Lists the repo's worktrees: tab name, branch, path. |
+| `wt claude` | Starts Claude in the current worktree: with a pending `--prompt`, a new session named after the tab that opens with that message; otherwise `claude --continue`, falling back to a new session. Layouts run this as the Claude pane's command. |
 | `wt sync` | Adds a tab for each worktree of each configured repo that lacks one, plus the `extra_tabs`. Reports tabs that match no worktree but does not close them. |
 | `wt clone <url> [dir]` | Bare-clones into `./<repo-name>` (or `dir`) with the main worktree at `work/<default-branch>`, adds a `[repos.<name>]` entry to the config, and opens its tab. |
 | `wt` | Outside zellij: attaches the session, creating it with a tab per worktree of every repo. Inside zellij: same as `wt sync`. |
@@ -71,6 +72,8 @@ shared_except "locked" {
 |------|---------|--------|
 | `-b <base>` | `new` | Base for a new branch (default: `base` in the config, `origin/main`). Ignored if the branch exists. |
 | `-n` | `new` | Dry run: print the branch, path and tab without changing anything. |
+| `--no-focus` | `new`, `open` | Open the tab in the background instead of switching to it. An existing tab is left unfocused. |
+| `--prompt <text>` | `new` | Start the new tab's Claude session with `<text>` as its first message. Only for a new worktree: if the branch is already checked out, `wt` exits with an error instead of focusing it. Needs a layout whose Claude pane runs `wt claude`. |
 | `-f` | `rm` | Remove even with uncommitted changes. |
 | `-d` | `rm` | Also delete the branch if it is merged into `base`. |
 
@@ -88,7 +91,7 @@ shared_except "locked" {
 | Path | Purpose |
 |------|---------|
 | `~/.config/wt/config.toml` | Global settings plus a `[repos.<name>]` entry per repo, in tab order. See `examples/config.toml`. |
-| `~/.config/wt/layouts/<repo>.kdl` | The panes of one worktree tab. Falls back to `default.kdl`, then to a built-in Claude + shell split. |
+| `~/.config/wt/layouts/<repo>.kdl` | The panes of one worktree tab. Falls back to `default.kdl`, then to a built-in Claude + shell split. The Claude pane should run `wt claude`, so `--prompt` reaches it. |
 | `~/.config/wt/hooks/<repo>/post-create`, `pre-remove` | Executables run inside the worktree with `WT_REPO`, `WT_NAME`, `WT_PATH`, `WT_BRANCH` and `WT_MAIN` set. A failing hook aborts the command. |
 
 `$XDG_CONFIG_HOME` and `$XDG_CACHE_HOME` are honoured. Generated zellij layouts go to `~/.cache/wt/`.
