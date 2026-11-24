@@ -86,6 +86,27 @@ shared_except "locked" {
 - Tabs of repos other than `default_repo` carry `tab_prefix` (`o/ABC-123`), so the same ticket in two repos gets two tabs.
 - If the ticket or branch is already checked out, `wt new` focuses that tab instead.
 
+## Zellij session resurrection
+
+Outside zellij, `wt` looks for the configured session in `zellij list-sessions --short`, which lists exited (resurrectable) sessions as well as running ones. If the name is there, `wt` runs `zellij attach <session>` and does not build a session from its own layout. Attaching to an exited session makes zellij resurrect it from the layout it saved.
+
+Zellij saves the command line of the process running in each pane, not the command the pane was launched with. `wt claude` therefore stays under a `bash -c` command, so a resurrected pane runs `claude --continue`, falling back to a new session. A `--prompt` is not sent again. A pane that was running `claude` directly, such as one started by an older `wt`, comes back as that command instead. Resurrected command panes are also `start_suspended`: they wait for Enter.
+
+### Restarting after a zellij upgrade
+
+Run this outside zellij. It ends every zellij session and the processes in its panes:
+
+```sh
+zellij kill-all-sessions -y
+zellij delete-all-sessions -y
+zellij list-sessions   # should list no sessions ("No active zellij sessions found.")
+wt
+```
+
+`zellij delete-all-sessions` by itself is not always enough. If the old server is still running, it can write its resurrection file again while it shuts down, after the delete has run. `wt` then finds the session listed and resurrects it. You can tell this happened because `~/.cache/wt/session.kdl` was not rewritten.
+
+If panes have already come back as plain `claude`, run `claude --continue` in each one to resume that worktree's latest conversation. The session files are kept under `~/.claude/projects/`.
+
 ## Files
 
 | Path | Purpose |

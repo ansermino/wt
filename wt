@@ -527,6 +527,14 @@ def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool,
         print(f"   cd {path} && wt claude" if prompt else f"   cd {path}")
 
 
+# `exit` keeps bash as the pane's process: zellij saves that command line and reruns it on resurrection.
+# The prompt travels in the environment, which zellij does not save, so it is not sent again.
+CLAUDE_SH = (
+    'p=${WT_PROMPT-}; unset WT_PROMPT; '
+    'if [ -n "$p" ]; then claude -n "$WT_TAB" "$p"; else claude --continue || claude; fi; exit $?'
+)
+
+
 def cmd_claude(repo: Repo) -> None:
     """A pending `--prompt` starts a fresh, named session once; otherwise resume or start one."""
     top = git("rev-parse", "--show-toplevel", cwd=Path.cwd(), check=False)
@@ -535,8 +543,8 @@ def cmd_claude(repo: Repo) -> None:
     if f.exists():
         prompt = f.read_text()
         f.unlink()
-        os.execvp("claude", ["claude", "-n", repo.tab(path), prompt])
-    os.execvp("bash", ["bash", "-c", "claude --continue || claude"])
+        os.environ.update(WT_PROMPT=prompt, WT_TAB=repo.tab(path))
+    os.execvp("bash", ["bash", "-c", CLAUDE_SH])
 
 
 def cmd_rm(repo: Repo, target: str, force: bool, delete_branch: bool) -> None:
