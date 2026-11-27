@@ -58,7 +58,7 @@ shared_except "locked" {
 | `wt new ABC-123` | Creates a worktree for the ticket, runs the post-create hook, and opens the tab `ABC-123`. |
 | `wt new my-branch` | Same for a plain branch name. `branch_prefix` is added unless the name already has a `/` or the branch exists. |
 | `wt new 123` | If #123 is a PR, checks out its head branch and opens the tab `PR-123`. If it is an issue, uses the issue's branch and opens the tab `GH-123`. Also accepts `#123` or the URL. Needs `gh`. |
-| `wt rm ABC-123` | Runs the pre-remove hook, removes the worktree, and closes its tab. |
+| `wt rm ABC-123` | Runs the pre-remove hook, removes the worktree, and closes its tab. If the worktree's directory is already deleted, it skips the hook; if the worktree is already removed, it only closes the tab. Run with no argument from a tab whose directory is gone, it offers to close that tab. |
 | `wt open ABC-123` | Opens or focuses the tab of an existing worktree. With no argument, uses the current directory's worktree. |
 | `wt ls` | Lists the repo's worktrees: tab name, branch, path. |
 | `wt claude` | Starts Claude in the current worktree: with a pending `--prompt`, a new session named after the tab that opens with that message; otherwise `claude --continue`, falling back to a new session. Variables given to `wt new --env` are set for it. Layouts run this as the Claude pane's command. |

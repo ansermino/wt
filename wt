@@ -16,6 +16,7 @@ The repo is `--repo NAME`, else the one containing $PWD, else `default_repo` fro
 A GitHub PR or issue is `123`, `#123` or its URL (needs `gh`). A PR checks out its head branch;
 an issue uses its linked branch, else an existing `123-…` branch, else a new `123-<title>`.
 `new`/`rm` with no target prompt for one (the form the zellij keybindings use).
+`rm` also closes the tab of a worktree that is already deleted or removed.
 `--no-focus` opens the tab in the background. `--prompt` starts the new tab's Claude session with
 TEXT as its first message; it needs a new worktree, so an existing one is an error. `--env` sets a
 variable for every Claude session `wt claude` starts in the new worktree, resumed ones included.
@@ -326,8 +327,9 @@ def resolve_branch(cfg: dict, repo: Repo, target: str, fetch: bool = False) -> t
 
 
 def find_worktree(repo: Repo, target: str) -> tuple[Path, str | None]:
-    p = Path(target).expanduser()
-    p = Path(git("rev-parse", "--show-toplevel", cwd=p, check=False) or p).resolve() if p.is_dir() else None
+    p = Path(target).expanduser().resolve()
+    if p.is_dir():
+        p = Path(git("rev-parse", "--show-toplevel", cwd=p, check=False) or p).resolve()
     t = target.rstrip("/").lower()
     wts = repo.worktrees()
     for path, branch in wts:
@@ -573,15 +575,34 @@ def cmd_claude(repo: Repo) -> None:
     os.execvp("bash", ["bash", "-c", CLAUDE_SH])
 
 
+def stale_tab(repo: Repo, target: str) -> int | None:
+    """The tab of a worktree that is already gone, by its path, dir name or tab name."""
+    if not in_zellij():
+        return None
+    names = {repo.tab(Path(target).expanduser().resolve()).lower(), target.rstrip("/").lower()}
+    return next((i for name, i in tabs().items() if name.lower() in names), None)
+
+
 def cmd_rm(repo: Repo, target: str, force: bool, delete_branch: bool) -> None:
-    path, branch = find_worktree(repo, target)
+    try:
+        path, branch = find_worktree(repo, target)
+    except Die:
+        if (tab_id := stale_tab(repo, target)) is None:
+            raise
+        print(f">> no worktree matches {target!r}; closing its tab")
+        zj("close-tab-by-id", str(tab_id))
+        return
     if path == repo.main:
         raise Die(f"refusing to remove the main worktree {path}")
-    if (dirty := git("status", "--porcelain", cwd=path)) and not force:
-        raise Die(f"{path} has uncommitted changes (use -f):\n{dirty}")
-    run_hook(repo, "pre-remove", path, branch)
     os.chdir(repo.main)
-    git("worktree", "remove", "--force", str(path), cwd=repo.common)
+    if path.exists():
+        if (dirty := git("status", "--porcelain", cwd=path)) and not force:
+            raise Die(f"{path} has uncommitted changes (use -f):\n{dirty}")
+        run_hook(repo, "pre-remove", path, branch)
+        git("worktree", "remove", "--force", str(path), cwd=repo.common)
+    else:
+        print(f"   {path} is already deleted; skipping the pre-remove hook")
+        git("worktree", "prune", cwd=repo.common)
     env_file(path).unlink(missing_ok=True)
     print(f">> removed {path}")
     if delete_branch and branch:
@@ -708,6 +729,12 @@ def main() -> None:
 
     prompted = args.cmd in ("new", "rm") and not args.target
     try:
+        os.getcwd()
+        gone = None
+    except FileNotFoundError:  # this pane's worktree was deleted under it
+        gone = Path(os.environ.get("PWD") or "/")
+        os.chdir(next((p for p in gone.parents if p.is_dir()), Path.home()))
+    try:
         if args.cmd == "clone":
             return cmd_clone(cfg, args.url, args.dir)
         repo = resolve_repo(cfg, args.repo)
@@ -716,8 +743,14 @@ def main() -> None:
                 target, base = (args.target, args.base) if args.target else prompt_new(repo)
                 cmd_new(cfg, repo, target, base, args.dry_run, not args.no_focus, args.prompt, parse_env(args.env))
             case "rm":
-                target, force, delete = ((args.target, args.force, args.delete_branch)
-                                         if args.target else prompt_rm(repo))
+                if args.target:
+                    target, force, delete = args.target, args.force, args.delete_branch
+                elif gone:
+                    if input(f"{gone} is gone; remove it and close its tab? [Y/n] ").strip().lower() == "n":
+                        sys.exit(0)
+                    target, force, delete = str(gone), False, False
+                else:
+                    target, force, delete = prompt_rm(repo)
                 cmd_rm(repo, target, force, delete)
             case "open":
                 path, _ = find_worktree(repo, args.target)
