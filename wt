@@ -3,7 +3,7 @@
 
   wt                                outside zellij: attach the one session (a tab per worktree of every repo)
                                     inside zellij:  same as `wt sync`
-  wt new  [<ABC-N|branch|#N>] [-b BASE] [-n] [--no-focus] [--prompt TEXT]
+  wt new  [<ABC-N|branch|#N>] [-b BASE] [-n] [--no-focus] [--prompt TEXT] [--env NAME=VALUE]...
                                             create a worktree, run its post-create hook, open its tab
   wt rm   [<name|ABC-N>] [-f] [-d]          run its pre-remove hook, remove it, close its tab
   wt open [<name|ABC-N|dir>] [--no-focus]   open or focus a worktree's tab (default: $PWD)
@@ -17,7 +17,8 @@ A GitHub PR or issue is `123`, `#123` or its URL (needs `gh`). A PR checks out i
 an issue uses its linked branch, else an existing `123-…` branch, else a new `123-<title>`.
 `new`/`rm` with no target prompt for one (the form the zellij keybindings use).
 `--no-focus` opens the tab in the background. `--prompt` starts the new tab's Claude session with
-TEXT as its first message; it needs a new worktree, so an existing one is an error.
+TEXT as its first message; it needs a new worktree, so an existing one is an error. `--env` sets a
+variable for every Claude session `wt claude` starts in the new worktree, resumed ones included.
 Tickets look like ABC-123 (`ticket_prefix` in the config), though any KEY-123 is accepted.
 Config, layouts and hooks live in ~/.config/wt/ (see config.toml there).
 """
@@ -39,6 +40,8 @@ from pathlib import Path
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wt"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "wt"
 PROMPT_DIR = CACHE_DIR / "prompts"
+ENV_DIR = CACHE_DIR / "env"
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 TICKET = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
 TICKET_IN_DIR = re.compile(r"(?:^|-)([a-z][a-z0-9]*-\d+)(?:-|$)")
 GH_REF = re.compile(r"#?(\d+)|https?://[^/]+/([^/]+/[^/]+)/(pull|issues)/(\d+)(?:[/?#].*)?")
@@ -417,6 +420,20 @@ def prompt_file(path: Path) -> Path:
     return PROMPT_DIR / str(path.resolve()).strip("/").replace("/", "%")
 
 
+def env_file(path: Path) -> Path:
+    return ENV_DIR / prompt_file(path).name
+
+
+def parse_env(pairs: list[str]) -> dict[str, str]:
+    env = {}
+    for pair in pairs:
+        name, sep, value = pair.partition("=")
+        if not sep or not ENV_NAME.fullmatch(name):
+            raise Die(f"--env takes NAME=VALUE, not {pair!r}")
+        env[name] = value
+    return env
+
+
 def sync(cfg: dict, repos: list[Repo]) -> None:
     if not in_zellij():
         raise Die("sync must run inside zellij")
@@ -453,15 +470,16 @@ def run_hook(repo: Repo, hook: str, path: Path, branch: str | None) -> None:
 
 
 def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool,
-            focus: bool = True, prompt: str | None = None) -> None:
+            focus: bool = True, prompt: str | None = None, env: dict[str, str] | None = None) -> None:
     if TICKET.fullmatch(target):
         try:
             path, branch = find_worktree(repo, target)
         except Die:
             pass
         else:
-            if prompt:
-                raise Die(f"{target} is already checked out at {path}; --prompt needs a new worktree")
+            if prompt or env:
+                flag = "--prompt" if prompt else "--env"
+                raise Die(f"{target} is already checked out at {path}; {flag} needs a new worktree")
             print(f">> {target} is already checked out at {path} ({branch})")
             if in_zellij() and not dry_run:
                 open_tab(repo, path, focus)
@@ -507,6 +525,8 @@ def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool,
     print(f">> branch {branch} ({how})\n   path   {path}\n   tab    {repo.tab(path)}")
     if prompt:
         print(f"   prompt {prompt}")
+    for name, value in (env or {}).items():
+        print(f"   env    {name}={value}")
     if dry_run:
         return
     if link:
@@ -521,6 +541,10 @@ def cmd_new(cfg: dict, repo: Repo, target: str, base: str | None, dry_run: bool,
         # The tab's `wt claude` consumes this; a pane can't inherit our environment.
         PROMPT_DIR.mkdir(parents=True, exist_ok=True)
         prompt_file(path).write_text(prompt)
+    if env:
+        # Kept until `wt rm`, so a resurrected or reopened pane starts Claude with it too.
+        ENV_DIR.mkdir(parents=True, exist_ok=True)
+        env_file(path).write_text(json.dumps(env))
     if in_zellij():
         open_tab(repo, path, focus)
     else:
@@ -544,6 +568,8 @@ def cmd_claude(repo: Repo) -> None:
         prompt = f.read_text()
         f.unlink()
         os.environ.update(WT_PROMPT=prompt, WT_TAB=repo.tab(path))
+    if (e := env_file(path)).exists():
+        os.environ.update(json.loads(e.read_text()))
     os.execvp("bash", ["bash", "-c", CLAUDE_SH])
 
 
@@ -556,6 +582,7 @@ def cmd_rm(repo: Repo, target: str, force: bool, delete_branch: bool) -> None:
     run_hook(repo, "pre-remove", path, branch)
     os.chdir(repo.main)
     git("worktree", "remove", "--force", str(path), cwd=repo.common)
+    env_file(path).unlink(missing_ok=True)
     print(f">> removed {path}")
     if delete_branch and branch:
         # `branch -d` judges against the bare repo's local HEAD, which lags origin; trust the base instead.
@@ -661,6 +688,8 @@ def main() -> None:
     p.add_argument("-n", "--dry-run", action="store_true", help="print what would happen")
     p.add_argument("--no-focus", action="store_true", help="open the tab without switching to it")
     p.add_argument("--prompt", help="first message for the new tab's Claude session")
+    p.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
+                   help="set for every Claude session in the new worktree (repeatable)")
     p = sub.add_parser("rm", help="remove a worktree and close its tab")
     p.add_argument("target", nargs="?", help=f"dir name, tab name ({key}-123), branch or path")
     p.add_argument("-f", "--force", action="store_true", help="remove even with uncommitted changes")
@@ -685,7 +714,7 @@ def main() -> None:
         match args.cmd:
             case "new":
                 target, base = (args.target, args.base) if args.target else prompt_new(repo)
-                cmd_new(cfg, repo, target, base, args.dry_run, not args.no_focus, args.prompt)
+                cmd_new(cfg, repo, target, base, args.dry_run, not args.no_focus, args.prompt, parse_env(args.env))
             case "rm":
                 target, force, delete = ((args.target, args.force, args.delete_branch)
                                          if args.target else prompt_rm(repo))
